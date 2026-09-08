@@ -108,9 +108,35 @@ def get_occupancy():
     return 2
 
 
+# Split-KV parallelism target, as a multiplier on top of ``get_occupancy()``.
+#
+# ``get_occupancy()`` reports how many workgroups of this kernel are resident
+# per CU.  Using it directly as the split-KV target makes
+# ``get_recommended_splits`` stop splitting as soon as
+# ``num_sequences * num_kv_heads`` reaches one full residency wave: on a 256-CU
+# CDNA4 part that wave is 512 workgroups, so a GQA decode at batch 64 with 8 KV
+# heads lands exactly on it and gets ``max_context_partition_num == 1`` -- no
+# split-KV at all, every workgroup walking its whole context serially.
+#
+# Filling residency once is the right target for a compute-bound kernel, but
+# paged decode attention is HBM-bandwidth bound: what saturates the memory
+# system is the number of *independent* K/V streams in flight, not the count of
+# resident workgroups.  Each workgroup here is only 4 warps / 256 threads
+# (``warps_per_cta=[4, 1]`` in ``define_layout`` below), a small enough
+# footprint that CDNA4 can keep more than one wave of them in flight, so aiming
+# at two waves buys extra memory-level parallelism for the price of one extra
+# reduce kernel.  CDNA3 keeps the original single-wave target.
+def get_split_kv_parallelism_multiplier():
+    return 2 if get_cdna_version() == 4 else 1
+
+
 def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
     props = torch.cuda.get_device_properties()
-    num_sm = props.multi_processor_count * get_occupancy()
+    num_sm = (
+        props.multi_processor_count
+        * get_occupancy()
+        * get_split_kv_parallelism_multiplier()
+    )
     max_context_partition_num = triton.cdiv(
         num_sm, num_sequences * num_kv_heads * split_kv_blocks
     )
