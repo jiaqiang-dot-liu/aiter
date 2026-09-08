@@ -656,13 +656,71 @@ __host__ __device__ void func(){{std::tuple<int, int> t = std::tuple(1, 1);}}" |
     return 554785 - 1
 
 
-def check_and_set_ninja_worker():
-    max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
+def _cgroup_available_bytes():
+    """Return the memory this process may actually use, honouring cgroup limits.
+
+    ``psutil.virtual_memory().available`` reports the *host* figure. Inside a
+    memory-limited container (the normal case for ROCm CI / inference images)
+    that can overstate the real allowance by more than an order of magnitude --
+    e.g. 2.6 TB host-available against a 200 GiB ``memory.max``. Sizing the
+    ninja worker pool off the host number then launches enough parallel hipcc
+    processes to blow the cgroup budget, and the build dies with SIGKILL (-9)
+    part-way through, leaving a stale lock + half-populated build directory.
+
+    Returns:
+        int: bytes available, i.e. ``min(host_available, cgroup_limit - usage)``.
+    """
     import psutil
 
+    avail = psutil.virtual_memory().available
+    # cgroup v2, then cgroup v1.
+    limit_usage = [
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        (
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ),
+    ]
+    for limit_path, usage_path in limit_usage:
+        try:
+            with open(limit_path) as f:
+                raw = f.read().strip()
+            if raw == "max":  # cgroup v2 "unlimited"
+                continue
+            limit = int(raw)
+            with open(usage_path) as f:
+                usage = int(f.read().strip())
+        # Best-effort probe: a missing/unreadable/unparseable cgroup file just
+        # means "no container limit visible", so fall back to the host figure.
+        except (OSError, ValueError):  # noqa: PERF203
+            continue
+        # A limit >= total RAM is the kernel's "no limit" sentinel.
+        if limit >= psutil.virtual_memory().total:
+            continue
+        avail = min(avail, max(0, limit - usage))
+        break
+    return avail
+
+
+def check_and_set_ninja_worker():
+    # sched_getaffinity honours cpuset cgroups / taskset; os.cpu_count() does not.
+    try:
+        n_cpu = len(os.sched_getaffinity(0))
+    except AttributeError:  # non-Linux
+        n_cpu = os.cpu_count() or 1
+    max_num_jobs_cores = max(1, n_cpu * 0.8)
+
     # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
-    max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
+    free_memory_gb = _cgroup_available_bytes() / (1024**3)  # free memory in GB
+    # 0.5 GB/job is far too optimistic for the CK/CKTile template instances the
+    # gemm *_tune modules generate -- a single hipcc there routinely peaks in
+    # the multi-GB range. Override with AITER_BUILD_MEM_PER_JOB_GB if needed.
+    try:
+        mem_per_job_gb = float(os.getenv("AITER_BUILD_MEM_PER_JOB_GB", "2.0"))
+    except ValueError:
+        mem_per_job_gb = 2.0
+    mem_per_job_gb = max(0.1, mem_per_job_gb)
+    max_num_jobs_memory = int(free_memory_gb / mem_per_job_gb)
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
     max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
