@@ -5,7 +5,8 @@ from jinja2 import Template
 
 from csrc.cpp_itfs.utils import AITER_CORE_DIR, compile_template_op, str_to_bool
 
-MD_NAME = "pa_ragged"
+# Fresh identity for the valid-partition-only ll4mi reduction in pa_kernels.cuh.
+MD_NAME = "pa_ragged_valid_partition_reduce_v2"
 
 with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged.cpp.jinja", "r") as f:
     src_template = Template(f.read())

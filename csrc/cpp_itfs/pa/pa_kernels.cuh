@@ -998,100 +998,21 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
             shared_global_exp_sum = global_exp_sum;
         }
     } // warpid == 0
+    __syncthreads();
+
+    // Read and accumulate only valid partitions.  Previously this reducer
+    // rounded each head element up to 16/32/64 global tmp_out loads, mapping
+    // invalid slots back to the final valid partition.  Decode sequences below
+    // 4096 tokens therefore issued redundant workspace traffic.  A single
+    // accumulator also avoids the 64-element per-thread temporary array.
     const scalar_t* tmp_out_ptr =
         tmp_out + (seq_idx * MTP + mtp) * num_heads * max_num_partitions * HEAD_SIZE +
         head_idx * max_num_partitions * HEAD_SIZE + threadIdx.x;
-    constexpr int MAX_NPAR = 64;
-    scalar_t tmps[MAX_NPAR];
-    const float dzero = 0.0f;
-#pragma unroll
-    for(int j = 0; j < MAX_NPAR; j++)
-    {
-        tmps[j] = from_float<scalar_t>(dzero);
-    }
-    const int last_partition_offset = (num_partitions - 1) * HEAD_SIZE;
-    const int num_partition_offset  = num_partitions * HEAD_SIZE;
-    int idx                         = 0;
-
-    constexpr int JCHUNK = 16;
-
-#pragma unroll
-    for(int j = 0; j < JCHUNK * HEAD_SIZE; j += HEAD_SIZE)
-    {
-        // lastj is last valid partition
-        const int lastj_offset = (j < num_partition_offset) ? j : last_partition_offset;
-        tmps[idx]              = tmp_out_ptr[lastj_offset];
-        idx++;
-    }
-    __syncthreads();
-
-    if(num_partitions > JCHUNK)
-    {
-#pragma unroll
-        for(int j = JCHUNK * HEAD_SIZE; j < 2 * JCHUNK * HEAD_SIZE; j += HEAD_SIZE)
-        {
-            const int lastj_offset = (j < num_partition_offset) ? j : last_partition_offset;
-            tmps[idx]              = tmp_out_ptr[lastj_offset];
-            idx++;
-        }
-
-        if(num_partitions > 2 * JCHUNK)
-        {
-#pragma unroll
-            for(int j = 2 * JCHUNK * HEAD_SIZE; j < MAX_NPAR * HEAD_SIZE; j += HEAD_SIZE)
-            {
-                const int lastj_offset = (j < num_partition_offset) ? j : last_partition_offset;
-                tmps[idx]              = tmp_out_ptr[lastj_offset];
-                idx++;
-            }
-        }
-    } // num_partitions > JCHUNK
-
-    // Aggregate tmp_out to out.
     float acc = 0.0f;
-#pragma unroll
-    for(int j = 0; j < JCHUNK; j++)
+    for(int partition = 0; partition < num_partitions; ++partition)
     {
-        acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-    }
-    if(num_partitions > JCHUNK)
-    {
-#pragma unroll
-        for(int j = JCHUNK; j < 2 * JCHUNK; j++)
-        {
-            acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-        }
-        if(num_partitions > 2 * JCHUNK)
-        {
-#pragma unroll
-            for(int j = 2 * JCHUNK; j < MAX_NPAR; j++)
-            {
-                acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-            }
-        }
-    }
-
-    for(int p = 1; p < NPAR_LOOPS; p++)
-    {
-        if(num_partitions > p * MAX_NPAR)
-        {
-            idx = 0;
-#pragma unroll
-            for(int j = p * MAX_NPAR * HEAD_SIZE; j < (p + 1) * MAX_NPAR * HEAD_SIZE;
-                j += HEAD_SIZE)
-            {
-                // lastj is last valid partition
-                const int lastj_offset = (j < num_partition_offset) ? j : last_partition_offset;
-                tmps[idx]              = tmp_out_ptr[lastj_offset];
-                idx++;
-            }
-
-#pragma unroll
-            for(int j = 0; j < MAX_NPAR; j++)
-            {
-                acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j + p * MAX_NPAR];
-            }
-        }
+        acc += to_float<scalar_t>(tmp_out_ptr[partition * HEAD_SIZE]) *
+               shared_exp_sums[partition];
     }
 
     const float inv_global_exp_sum = __fdividef(1.0f, shared_global_exp_sum + 1e-6f);
