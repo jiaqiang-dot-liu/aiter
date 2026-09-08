@@ -686,6 +686,86 @@ def gemm_a8w8_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
+# ---------------------------------------------------------------------------
+# Kernel-name overrides for gemm_a8w8_bpreshuffle, keyed exactly like the tuned
+# CSV: ``(gfx, cu_num, M, N, K)``.  An entry is used only for that one exact
+# shape, so every other shape -- tuned or untuned -- keeps byte-identical
+# dispatch.
+#
+# gfx950/M=64/N=6144/K=4096 is the Qwen3-8B TP1 decode projection at batch 64.
+# The tuned row that ships for it (model_configs/..._glm5.2.csv) selects
+# ``libtype=flydsl`` with the kernelName
+#   flydsl_bpreshuflle_32x64x512_F8_F8_B16_2x1x0x1x4_default
+# whose knob field carries *five* tokens.  `_parse_flydsl_kernel_name` only
+# understands up to four, so the regex fails, `gemm_a8w8_bpreshuffle_flydsl`
+# silently falls through to `gemm_a8w8_bpreshuffle_ck`, and the shape ends up on
+# the CK default heuristic (an ``MPerBlock=16`` instance, ~17.9 us measured)
+# instead of on the kernel it was tuned to.
+#
+# This entry restores the tuned intent using the 4-token spelling the parser
+# does accept: the FlyDSL ``32x64x512`` tile runs 2 M-tiles x 96 N-tiles = 192
+# workgroups (vs. the CK instance's much thinner slices), ``use_async_copy=1``
+# streams the A operand gmem->LDS, and the XCD swizzle co-locates the two
+# M-siblings that share one 256 KB B panel on the same XCD so the second pass is
+# a per-XCD L2 hit rather than an LLC read.  ``lds_stage=2`` is required: stage 1
+# selects a single-buffered loop with an extra barrier per K-tile and no A
+# prefetch overlap (measured 16.6 us vs 15.2 us).
+_BPRESHUFFLE_KERNEL_OVERRIDE: dict = {
+    ("gfx950", 256, 64, 6144, 4096): (
+        "flydsl_bpreshuflle_32x64x512_F8_F8_B16_1x1x8x2_default"
+    ),
+}
+
+# Shapes whose FlyDSL module has already been JIT-compiled + loaded in this
+# process.  Loading a module is illegal during HIP graph capture, so the cold
+# path defers to the stock dispatch; once warm the fast path is a plain kernel
+# launch and is capture-safe.
+_BPRESHUFFLE_OVERRIDE_WARM: set = set()
+
+
+def _try_bpreshuffle_kernel_override(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    m: int,
+    n: int,
+    k: int,
+) -> Tensor | None:
+    """FlyDSL fast path for overridden shapes; ``None`` means "use stock dispatch"."""
+    if not _BPRESHUFFLE_KERNEL_OVERRIDE or not is_flydsl_available():
+        return None
+    try:
+        key = (get_gfx(), get_cu_num(), m, n, k)
+    except Exception:  # noqa: BLE001
+        return None
+    kernel_name = _BPRESHUFFLE_KERNEL_OVERRIDE.get(key)
+    if kernel_name is None:
+        return None
+    if key not in _BPRESHUFFLE_OVERRIDE_WARM:
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        out = gemm_a8w8_bpreshuffle_flydsl(
+            XQ, WQ, x_scale, w_scale, Y, {"kernelName": kernel_name}
+        )
+    except Exception as e:  # noqa: BLE001
+        # Never let the fast path lose the call: drop the entry and fall through
+        # to the unmodified dispatch below.
+        logger.warning(
+            f"gemm_a8w8_bpreshuffle kernel override '{kernel_name}' failed for "
+            f"M={m}, N={n}, K={k} ({e}); reverting this shape to stock dispatch."
+        )
+        _BPRESHUFFLE_KERNEL_OVERRIDE.pop(key, None)
+        return None
+    _BPRESHUFFLE_OVERRIDE_WARM.add(key)
+    return out
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_fake)
 def gemm_a8w8_bpreshuffle(
     XQ: Tensor,
@@ -721,6 +801,16 @@ def gemm_a8w8_bpreshuffle(
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    # Exact-shape kernel override.  Returns None (leaving Y untouched) unless
+    # this precise (gfx, cu_num, M, N, K) has an entry and FlyDSL is usable, so
+    # every other shape falls straight through to the stock dispatch below.
+    if w_k == k:
+        out = _try_bpreshuffle_kernel_override(
+            XQ, WQ, x_scale, w_scale, Y, m, n, k
+        )
+        if out is not None:
+            return out
 
     # CKTile only supports bf16 dtype
     config = get_GEMM_config_with_quant_type(
