@@ -104,19 +104,32 @@ def mp_lock(
     from aiter.jit.utils.file_baton import FileBaton
 
     baton = FileBaton(lock_path)
-    if baton.try_acquire():
-        try:
-            ret = main_func()
-        finally:
-            if final_func is not None:
-                final_func()
-            baton.release()
-    else:
-        baton.wait()
-        if wait_func is not None:
-            ret = wait_func()
-        ret = None
-    return ret
+    while True:
+        if baton.try_acquire():
+            try:
+                ret = main_func()
+            finally:
+                if final_func is not None:
+                    final_func()
+                baton.release()
+            return ret
+        # baton.wait() returns True if the previous holder released the lock
+        # normally (its work is done, safe to reuse), or False if we broke a
+        # *stale* lock left by a dead/abandoned holder (e.g. a crashed or
+        # zombified build subprocess -- see aiter/jit/utils/file_baton.py).
+        # In the False case nobody actually finished building the artifact,
+        # so loop back and build it ourselves instead of falling through as
+        # if it were ready. Falling through (the old behavior) leaves
+        # compile_hsaco() callers believing a missing .hsaco/.json pair
+        # exists, which surfaces upstream as a stuck JIT pipeline / silent
+        # kernel_agent waiting on an artifact that will never appear. This
+        # mirrors the already-correct retry loop in aiter/jit/core.py's
+        # mp_lock; this copy (used by the FlyDSL hsaco JIT path) had drifted
+        # from it and lost the retry.
+        if baton.wait():
+            if wait_func is not None:
+                return wait_func()
+            return None
 
 
 def get_hip_version():
