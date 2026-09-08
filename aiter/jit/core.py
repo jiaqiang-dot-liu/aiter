@@ -420,29 +420,44 @@ class AITER_CONFIG:
                     .index
                 )
 
+                # Resolve in-memory first so the merged table this call returns
+                # is always usable.  The merge now runs on every lookup (the
+                # packaged default is always one of the sources), so a
+                # duplicate shape between the default table and a
+                # model_configs/ or env overlay must NOT be fatal -- raising
+                # here would take down every process that ships an overlay.
+                merge_df = merge_df[merge_df.index.isin(best_row_index)]
+
                 saved_files = []
                 offset = 0
                 for src_path, src_df in source_pairs:
                     start, end = offset, offset + len(src_df)
                     offset = end
-                    file_rows = merge_df.iloc[start:end]
-                    new_src_df = file_rows[
-                        file_rows.index.isin(best_row_index)
-                    ].reset_index(drop=True)
-                    if len(new_src_df) < len(src_df):
-                        new_src_df.to_csv(src_path, index=False)
-                        saved_files.append(
-                            f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
-                        )
+                    file_rows = merge_df[
+                        (merge_df.index >= start) & (merge_df.index < end)
+                    ]
+                    if len(file_rows) < len(src_df):
+                        # Best-effort writeback: the packaged aiter tree is
+                        # read-only in most container deployments, and losing
+                        # the writeback only costs us the dedup on the next
+                        # process start -- it never affects this process.
+                        try:
+                            file_rows.reset_index(drop=True).to_csv(
+                                src_path, index=False
+                            )
+                            saved_files.append(
+                                f"  {src_path}: {len(src_df)} -> {len(file_rows)} rows"
+                            )
+                        except OSError as e:
+                            saved_files.append(f"  {src_path}: not writable ({e})")
                 saved_info = (
                     "\n".join(saved_files) if saved_files else "  (no files updated)"
                 )
-                raise RuntimeError(
+                logger.warning(
                     f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
-                    f"and saved back to source config files. Please re-run.\n"
-                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
-                    f"Updated files:\n{saved_info}"
+                    f"Auto-resolved in-memory by keeping the best performing (lowest 'us') "
+                    f"entry for each shape; continuing with the merged table.\n"
+                    f"Writeback:\n{saved_info}"
                 )
         else:
             logger.warning(
@@ -473,27 +488,37 @@ class AITER_CONFIG:
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
         from pathlib import Path
 
-        if not config_env_file:
-            model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
-            op_tuned_file_list = [
-                p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
-                if (p.is_file() and "untuned" not in p.name)
-            ]
+        model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+        op_tuned_file_list = [
+            str(p)
+            for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+            if (p.is_file() and "untuned" not in p.name)
+        ]
 
-            if not op_tuned_file_list:
-                config_file = default_file
-            else:
-                tuned_files = ":".join(str(p) for p in op_tuned_file_list)
-                tuned_files = default_file + ":" + tuned_files
-                logger.info(
-                    f"merge tuned file under model_configs/ and configs/ {tuned_files}"
-                )
-                config_file = self.update_config_files(tuned_files, tuned_file_name)
-        else:
-            config_file = self.update_config_files(config_env_file, tuned_file_name)
-            # print(f"get config file from environment ", config_file)
-        return config_file
+        # An operator-supplied table (env var) is an OVERLAY on top of the
+        # packaged tables, never a replacement for them.  Historically the env
+        # branch passed only the env path to update_config_files(), and a
+        # single path short-circuits the merge -- so pointing the env at a
+        # freshly tuned table with a handful of shapes silently DISCARDED the
+        # ~1.5k packaged entries and every model_configs/ overlay.  Every shape
+        # outside the new table then fell back to the untuned default kernel,
+        # which is how a real micro-level win shows up as zero (or negative)
+        # end-to-end gain.  Always union: packaged default, then model_configs/
+        # overlays, then the env paths.
+        path_list = [default_file] + op_tuned_file_list
+        if config_env_file:
+            for p in config_env_file.split(os.pathsep):
+                if p and p not in path_list:
+                    path_list.append(p)
+
+        if len(path_list) <= 1:
+            return default_file
+
+        tuned_files = os.pathsep.join(path_list)
+        logger.info(
+            f"[{env_name}] merging tuned tables for '{tuned_file_name}': {tuned_files}"
+        )
+        return self.update_config_files(tuned_files, tuned_file_name)
 
 
 AITER_CONFIGS = AITER_CONFIG()
