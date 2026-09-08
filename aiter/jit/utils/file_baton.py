@@ -21,7 +21,13 @@ class FileBaton:
     between creating and writing the file.
     """
 
-    def __init__(self, lock_file_path, wait_seconds=0.2, stale_grace_seconds=10.0):
+    def __init__(
+        self,
+        lock_file_path,
+        wait_seconds=0.2,
+        stale_grace_seconds=10.0,
+        hard_timeout_seconds=None,
+    ):
         """
         Create a new :class:`FileBaton`.
 
@@ -33,10 +39,28 @@ class FileBaton:
                 info (e.g. a 0-byte lock from a crash), how old it must be
                 before being treated as stale. Protects the brief window
                 between create and write in a healthy builder.
+            hard_timeout_seconds: Upper bound, in seconds, that ``wait()``
+                will block on a *live* holder before force-breaking the lock
+                anyway. Defaults to the ``AITER_JIT_LOCK_TIMEOUT_S`` env var
+                (1800s if unset); pass a value <= 0 to disable and wait
+                forever (previous behavior). This covers a holder whose pid
+                is alive but stuck making no forward progress (e.g. a hipcc
+                child stuck in D-state / thrashing under memory pressure from
+                oversubscribed concurrent JIT builds) — `_is_stale()` alone
+                never fires for this case since the pid never actually dies,
+                which otherwise wedges every waiter (and everything upstream
+                polling for a build result) indefinitely and silently.
         """
         self.lock_file_path = lock_file_path
         self.wait_seconds = wait_seconds
         self.stale_grace_seconds = stale_grace_seconds
+        if hard_timeout_seconds is None:
+            hard_timeout_seconds = float(
+                os.environ.get("AITER_JIT_LOCK_TIMEOUT_S", "1800")
+            )
+        self.hard_timeout_seconds = (
+            hard_timeout_seconds if hard_timeout_seconds > 0 else None
+        )
         self.fd = None
 
     def try_acquire(self):
@@ -72,6 +96,7 @@ class FileBaton:
             f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
             f"waiting for baton release at {self.lock_file_path}"
         )
+        wait_start = time.time()
         while True:
             if not os.path.exists(self.lock_file_path):
                 return True
@@ -81,6 +106,22 @@ class FileBaton:
                     f"{self.lock_file_path} (dead/abandoned holder)"
                 )
                 return False
+            if (
+                self.hard_timeout_seconds is not None
+                and (time.time() - wait_start) > self.hard_timeout_seconds
+            ):
+                if self._try_force_break():
+                    logger.error(
+                        f"[pid={os.getpid()}] force-broke lock at "
+                        f"{self.lock_file_path} after {self.hard_timeout_seconds:.0f}s "
+                        "with a live but non-progressing holder (suspected "
+                        "thrashing/hung build); re-running the work ourselves"
+                    )
+                    return False
+                # Another waiter raced us and force-broke it, or it was
+                # released/re-acquired in between: re-arm the timer and
+                # keep polling against the new state.
+                wait_start = time.time()
             time.sleep(self.wait_seconds)
 
     def release(self):
@@ -145,6 +186,31 @@ class FileBaton:
         try:
             # Re-verify under the steal lock to avoid racing a fresh acquire.
             if os.path.exists(self.lock_file_path) and self._is_stale():
+                try:
+                    os.remove(self.lock_file_path)
+                except FileNotFoundError:
+                    pass
+                return True
+            return False
+        finally:
+            os.close(sfd)
+            try:
+                os.remove(steal_path)
+            except FileNotFoundError:
+                pass
+
+    def _try_force_break(self):
+        """Unconditionally break the lock (no staleness re-check), used only
+        after ``hard_timeout_seconds`` has elapsed. Same single-breaker
+        ``.steal`` guard as :meth:`_try_break_stale` so concurrent waiters
+        don't all remove/redo the work at once."""
+        steal_path = self.lock_file_path + ".steal"
+        try:
+            sfd = os.open(steal_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
+        try:
+            if os.path.exists(self.lock_file_path):
                 try:
                     os.remove(self.lock_file_path)
                 except FileNotFoundError:
