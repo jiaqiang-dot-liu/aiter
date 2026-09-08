@@ -29,6 +29,14 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 
+# Fallback for bf16 A16W16 shapes that have NO row in bf16_tuned_gemm.csv.
+# Instead of dropping straight to torch/hipBLASLt's generic heuristic, let the
+# aiter asm bf16 GEMM's own runtime heuristic (get_heuristic_kernel() in
+# csrc/py_itfs_cu/asm_gemm_a16w16.cu) pick tile + splitK. Off-switch and M cap
+# are env tunable so the behaviour can be A/B'd without a rebuild.
+A16W16_ASM_DEFAULT = int(os.environ.get("AITER_A16W16_ASM_DEFAULT", "1")) != 0
+A16W16_ASM_DEFAULT_MAX_M = int(os.environ.get("AITER_A16W16_ASM_DEFAULT_MAX_M", "128"))
+
 try:
     from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
 except Exception:  # noqa: BLE001  blanket catch is intentional here
@@ -210,6 +218,28 @@ def get_GEMM_A16W16_config(
             default_config["libtype"] = "skinny"
             default_config["solidx"] = 2
             default_config["kernelName"] = ""
+        elif (
+            A16W16_ASM_DEFAULT
+            and gfx == "gfx950"
+            and eval(dtype) == dtypes.bf16
+            and (eval(otype) == dtypes.bf16 or eval(otype) == dtypes.fp32)
+            and N % 64 == 0
+            and K % 64 == 0
+            and M <= A16W16_ASM_DEFAULT_MAX_M
+        ):
+            # No tuned row for this shape (e.g. Qwen3-8B gate_up N=24576,K=4096
+            # and down N=4096,K=12288 are absent from bf16_tuned_gemm.csv, which
+            # only carries N in {128,256,2048,3072,6144}).  hsa/gfx950/bf16gemm
+            # ships NON-preshuffled tileN=64 kernels (tileM in {32,48,64,80,96},
+            # bias + splitK capable) and get_heuristic_kernel() selects tile and
+            # splitK from (M,N,K,cu_num) at runtime, so no tuned CSV row is
+            # needed.  Same construction the bpreshuffle branch above relies on.
+            # Capped at decode-ish M: above that the tileM<=96 asm kernels lose
+            # to hipBLASLt's 128x64x128 macro tiles.
+            default_config["libtype"] = "asm"
+            default_config["solidx"] = 0
+            default_config["splitK"] = None
+            default_config["kernelName"] = None
         if not default_config:
             # gfx1250 has no tuned ASM/skinny/hipblaslt bf16 kernels, so the
             # torch fallback lands on hipBLASLt, which is markedly slower than
