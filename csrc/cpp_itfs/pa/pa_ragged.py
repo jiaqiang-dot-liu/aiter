@@ -29,9 +29,10 @@ def compile(
     import os
 
     version = os.getenv("QKV_VERSION", "GOLDEN")
-    if version == "EXPERIMENTAL" and (head_size != 128 or kv_dtype != "__hip_bfloat16"):
+    if version == "EXPERIMENTAL" and (head_size != 128 or kv_dtype not in ("__hip_bfloat16", "uint8_t")):
         print(
-            "EXPERIMENTAL pa_ragged kernel requires head_size=128 and kv_dtype=bf16. Fallback to original kernel"
+            "EXPERIMENTAL pa_ragged kernel requires head_size=128 and kv_dtype in (bf16, fp8_e4m3). "
+            "Fallback to original kernel"
         )
 
     return compile_template_op(
