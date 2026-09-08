@@ -114,6 +114,30 @@ class FileBaton:
             return False
         except PermissionError:
             return True  # exists but owned by another user
+        # The pid is still present in the process table, but a zombie
+        # ('Z' state, i.e. exited-but-unreaped) has already terminated and
+        # will never resume building -- it will only ever be reaped by its
+        # parent (or, once orphaned, by PID 1). In containers where PID 1 is
+        # not a real init and never reaps orphans (observed here: a `ninja`
+        # build helper left as a permanent `[ninja] <defunct>` zombie under
+        # ppid=1), os.kill(pid, 0) keeps succeeding forever, so a lock whose
+        # recorded owner died mid-build would never be judged stale and
+        # every waiter would spin in wait() indefinitely -- exactly the
+        # "JIT build stuck / kernel_agent silent" failure mode this baton
+        # exists to prevent. Treat a zombie as dead so its lock can be
+        # broken and the work retried.
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                stat = f.read().decode(errors="replace")
+            # comm (2nd field) is parenthesized and may itself contain
+            # spaces/parens, so find the state field after the last ')'.
+            state = stat[stat.rindex(")") + 2]
+            if state == "Z":
+                return False
+        except (FileNotFoundError, OSError, ValueError, IndexError):
+            # /proc unavailable or unparsable: fall back to the kill(0)
+            # verdict rather than risk mis-detecting an unrelated pid.
+            pass
         return True
 
     def _is_stale(self):
