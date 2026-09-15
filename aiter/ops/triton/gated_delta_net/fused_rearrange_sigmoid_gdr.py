@@ -203,6 +203,8 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    safe_gate: bool = False,
+    lower_bound: float = -5.0,
     core_attn_out: torch.Tensor | None = None,
     draft_window: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -346,6 +348,8 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
+        SAFE_GATE=safe_gate,
+        LOWER_BOUND=lower_bound,
         num_warps=num_warps,
         num_stages=num_stages,
     )

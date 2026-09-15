@@ -58,6 +58,8 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    SAFE_GATE: tl.constexpr = False,
+    LOWER_BOUND: tl.constexpr = -5.0,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -123,10 +125,17 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         b_b = tl.load(p_b).to(tl.float32)
 
         x = tl.load(p_a).to(tl.float32) + tl.load(p_dt_bias).to(tl.float32)
-        softplus_x = tl.where(
-            beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
-        )
-        b_g = -tl.exp(tl.load(p_A_log).to(tl.float32)) * softplus_x
+        b_A = tl.load(p_A_log).to(tl.float32)
+        if SAFE_GATE:
+            # Bounded KDA gate: LOWER_BOUND * sigmoid(exp(A) * x), bounded to
+            # (LOWER_BOUND, 0). Mirrors vLLM's KDA SAFE_GATE branch; note the sign,
+            # +exp(A) here versus -exp(A) on the softplus branch.
+            b_g = LOWER_BOUND / (1.0 + tl.exp(-(tl.exp(b_A) * x)))
+        else:
+            softplus_x = tl.where(
+                beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+            )
+            b_g = -tl.exp(b_A) * softplus_x
 
         b_beta = tl.sigmoid(b_b.to(tl.float32))
 
