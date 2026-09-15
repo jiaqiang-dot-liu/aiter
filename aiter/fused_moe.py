@@ -1624,6 +1624,8 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 
 cfg_2stages = None
+# Shapes already reported as having no tuned config; warn once per shape.
+_fmoe_cfg_miss_warned = set()
 cfg_2stages_by_file = {}
 # fmt: off
 fused_moe_1stage_dict = {
@@ -2999,6 +3001,26 @@ def get_2stage_cfgs(
         logger.warning(
             f"[fused_moe] discarding 1-stage tuned config for unsupported "
             f"activation {activation}; using default heuristics"
+        )
+
+    if cfg is None and not bypass_tuned_config and keys not in _fmoe_cfg_miss_warned:
+        # A tuned-config miss is otherwise silent: we fall through to the generic
+        # heuristics and the operator sees "tuning had no effect" rather than
+        # "the tuned config was never consulted". The lookup key carries the
+        # runtime per-rank inter_dim (w2.shape[-1]), so a CSV tuned at a different
+        # TP degree -- or a different gfx/cu_num -- can never match.
+        _fmoe_cfg_miss_warned.add(keys)
+        _q_dtype_w_str = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
+        logger.warning(
+            f"[fused_moe] NO tuned config for gfx={gfx} cu_num={cu_num} "
+            f"token={token} model_dim={model_dim} inter_dim={inter_dim} "
+            f"expert={expert} topk={topk}; using default heuristics. If you "
+            f"expected a tuned config to apply, check it was tuned for this "
+            f"gfx/cu_num and this per-rank inter_dim (inter_dim is sharded by "
+            f"TP). To tune this exact shape, append to untuned_fmoe.csv:\n"
+            f"{token},{model_dim},{inter_dim},{expert},{topk},{activation},"
+            f"{dtype},{q_dtype_a},{_q_dtype_w_str},{q_type},"
+            f"{int(use_g1u1)},{int(doweight_stage1)}"
         )
 
     use_non_temporal_load = False
