@@ -1623,6 +1623,70 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     return 0
 
 
+_FMOE_SHAPE_FALLBACK_K_TILE = 256
+
+
+def _shape_fallback_enabled() -> bool:
+    # Opt-out kill switch: AITER_FMOE_SHAPE_FALLBACK=0 restores the previous
+    # exact-match-only lookup behaviour.
+    return os.environ.get("AITER_FMOE_SHAPE_FALLBACK", "1") == "1"
+
+
+def _nearest_shape_cfg(primary: dict, keys: tuple):
+    """Borrow a tuned row for an MoE shape that was never tuned.
+
+    ``primary`` is keyed on the full shape tuple, model_dim / expert / topk
+    included, so a model whose MoE shape is absent from every tuned CSV misses
+    completely and drops into the untuned heuristic branch. That branch leaves
+    ``kernelName1``/``kernelName2`` empty, and an empty name can never satisfy
+    the ``flydsl_`` prefix test in the caller -- so an untuned MXFP4 MoE is
+    pinned to the generic CK 2stages path even though every tuned MXFP4 config
+    shipped in aiter/configs/model_configs (dsv3, glm5, minimax_m3, kimik3,
+    qwen3_5_397b) selects a flydsl kernel once token >= 32.
+
+    Only per_1x32 is eligible: it is the quant type whose fast path lives in
+    flydsl and which therefore degrades hardest when no tuned row exists.
+    Candidates must agree on everything that actually selects a kernel instance
+    -- arch, CU count, token tier, inter_dim (the N tile), activation, dtypes,
+    g1u1 and doweight_stage1 -- and may differ only in model_dim, expert and
+    topk. model_dim is just the K loop trip count and expert/topk only affect
+    sorting, not the GEMM instance, so the borrowed choice stays legal as long
+    as K tiles evenly.
+    """
+    if str(keys[11]) != str(QuantType.per_1x32):
+        return None
+    model_dim = keys[3]
+    if model_dim % _FMOE_SHAPE_FALLBACK_K_TILE != 0:
+        return None
+
+    best_key = None
+    best_rank = None
+    for cand in primary:
+        # keys layout:
+        # 0 gfx, 1 cu_num, 2 token, 3 model_dim, 4 inter_dim, 5 expert,
+        # 6 topk, 7 act_type, 8 dtype, 9 q_dtype_a, 10 q_dtype_w,
+        # 11 q_type, 12 use_g1u1, 13 doweight_stage1
+        if cand[:3] != keys[:3] or cand[4] != keys[4] or cand[7:] != keys[7:]:
+            continue
+        if cand[3] % _FMOE_SHAPE_FALLBACK_K_TILE != 0:
+            continue
+        rank = (
+            abs(int(cand[3]) - int(model_dim)),
+            abs(int(cand[5]) - int(keys[5])),
+            abs(int(cand[6]) - int(keys[6])),
+        )
+        if best_rank is None or rank < best_rank:
+            best_rank, best_key = rank, cand
+    if best_key is None:
+        return None
+    logger.info(
+        f"[fused_moe] no tuned config for {keys}; borrowing kernel choice from "
+        f"nearest tuned shape model_dim={best_key[3]} expert={best_key[5]} "
+        f"topk={best_key[6]} (set AITER_FMOE_SHAPE_FALLBACK=0 to disable)"
+    )
+    return primary[best_key]
+
+
 cfg_2stages = None
 cfg_2stages_by_file = {}
 # fmt: off
@@ -2855,6 +2919,11 @@ def get_2stage_cfgs(
                     result = fallback.get(keys_fb_disabled, None)
                 if result is not None:
                     break
+        # Nearest-shape fallback: an untuned MXFP4 shape would otherwise land
+        # in the heuristic branch with empty kernel names, which permanently
+        # excludes it from the flydsl MXFP4 kernels.
+        if result is None and _shape_fallback_enabled():
+            result = _nearest_shape_cfg(primary, keys)
         return result
 
     cfg = _lookup_cfg(active_cfg_2stages)
