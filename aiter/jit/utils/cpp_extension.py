@@ -1565,6 +1565,25 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
         command.extend(["-j", str(num_workers)])
     env = os.environ.copy()
 
+    # AITER_JIT_BUILD_TIMEOUT_SEC: hard wall-clock bound on the ninja
+    # subprocess. Without this, a wedged hipcc/ninja child (compiler
+    # deadlock, hung linker, resource contention under a huge combinatorial
+    # kernel-instance matrix e.g. opus_gemm's on-demand kid expansion) blocks
+    # this call forever. Because build_module()/_ensure_kids_compiled() hold
+    # a FileBaton (mp_lock) across this call, an indefinite hang here means
+    # the lock's owning PID stays alive forever, so FileBaton._is_stale()
+    # never trips and every other process waiting on that module's build
+    # (e.g. subsequent kernel_opt run_optimization dispatches) spins forever
+    # too -- observed as "build_count unchanged for N ticks" with no hipcc/
+    # ninja process left running once the wedge is later reaped. Default is
+    # generous (30 min) to not disturb legitimately large from-scratch
+    # builds; set to 0/negative to disable (old blocking behavior).
+    try:
+        _timeout_sec = float(os.environ.get("AITER_JIT_BUILD_TIMEOUT_SEC", "1800"))
+    except ValueError:
+        _timeout_sec = 1800.0
+    _timeout = _timeout_sec if _timeout_sec > 0 else None
+
     try:
         sys.stdout.flush()
         sys.stderr.flush()
@@ -1588,7 +1607,20 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
             cwd=build_directory,
             check=True,
             env=env,
+            timeout=_timeout,
         )
+    except subprocess.TimeoutExpired as e:
+        message = (
+            f"{error_prefix}: ninja build exceeded AITER_JIT_BUILD_TIMEOUT_SEC="
+            f"{_timeout_sec}s in {build_directory} and was killed. This "
+            "usually means a wedged hipcc/ninja worker rather than a slow "
+            "but progressing build; rerun with AITER_JIT_BUILD_TIMEOUT_SEC "
+            "raised (or <=0 to disable) if this build is legitimately "
+            "long-running."
+        )
+        if e.output:
+            message += f": {e.output.decode(*SUBPROCESS_DECODE_ARGS)}"
+        raise RuntimeError(message) from e
     except subprocess.CalledProcessError as e:
         # Python 2 and 3 compatible way of getting the error object.
         _, error, _ = sys.exc_info()
