@@ -27,6 +27,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_quant_no_prefill_max_bytes = int(
         os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", "-1")
     )
+    # Byte cutoff gating whether the plain (non-quant) fused AR+RMSNorm path
+    # is attempted at all in fused_allreduce_rmsnorm /
+    # fused_allreduce_rmsnorm_quant_per_group. Historically hardcoded to
+    # 8*1024*8192 (64 MiB); large chunked-prefill batches (e.g. a full
+    # 16384-token chunk at hidden=4096 in bf16 == 128 MiB) exceed that and
+    # silently fall back to unfused all-reduce + separate RMSNorm even though
+    # the underlying 2-stage kernel (see aiter#3745, "unlock 80-tokens
+    # limit") has no such size restriction. Overridable via
+    # AITER_AR_FUSION_MAX_BYTES; unset/negative keeps the historical default.
+    _ar_fusion_max_bytes = int(os.environ.get("AITER_AR_FUSION_MAX_BYTES", "-1"))
 
     def __init__(
         self,
@@ -270,8 +280,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if x_pad_to_multiple > 0:
             out_n = (n + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
         total_bytes = input_.numel() * input_.element_size()
+        fusion_bytes_limit = (
+            self._ar_fusion_max_bytes
+            if self._ar_fusion_max_bytes >= 0
+            else 8 * 1024 * 8192
+        )
         can_use_fuse_ar_rms = (
-            n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
+            n <= 16384 and total_bytes < fusion_bytes_limit and self.world_size != 6
         )
         ca_comm = self.ca_comm
         can_use_custom_ar = (
@@ -526,10 +541,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         K = input_.shape[-1]
         fused_ok = False
         out = res_out = scale_out = bf16_out = None
+        fusion_bytes_limit = (
+            self._ar_fusion_max_bytes
+            if self._ar_fusion_max_bytes >= 0
+            else 8 * 1024 * 8192
+        )
         if (
             K % group_size == 0
             and K <= 16384
-            and total_bytes < 8 * 1024 * 8192
+            and total_bytes < fusion_bytes_limit
             and self.world_size != 6
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
