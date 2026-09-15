@@ -826,15 +826,20 @@ struct AllReduceTwoshot
             int32x4_t* recv_buffer = reinterpret_cast<int32x4_t*>(rank_buffer + comm_data0_offset);
             uint32_t* flag_ptr     = reinterpret_cast<uint32_t*>(rank_buffer + comm_flags0_offset);
 
+            // Poll all peers concurrently.  The old loop made thread 0 wait
+            // for every peer in rank order and executed a block barrier after
+            // each flag.  That serializes the TP critical path and costs
+            // kWorldSize barriers even though no peer data is consumed until
+            // its flag is visible.  One lane per peer plus a single barrier
+            // preserves the producer/consumer ordering for the whole block.
+            if(thread < kWorldSize)
+            {
+                wait_sync_flag(&flag_ptr[thread], flag_color);
+            }
+            __syncthreads();
+
             for(int r = 0; r < kWorldSize; r++)
             {
-                // Wait for the flags to be set.
-                if(thread == 0)
-                {
-                    wait_sync_flag(&flag_ptr[r], flag_color);
-                }
-                __syncthreads();
-
                 // note: we reuse tA as temp buffer here
                 codec.recv(&recv_buffer, tA);
 
@@ -868,15 +873,14 @@ struct AllReduceTwoshot
             int32x4_t* recv_buffer = reinterpret_cast<int32x4_t*>(rank_buffer + comm_data1_offset);
             uint32_t* flag_ptr     = reinterpret_cast<uint32_t*>(rank_buffer + comm_flags1_offset);
 
+            if(thread < kWorldSize)
+            {
+                wait_sync_flag(&flag_ptr[thread], flag_color);
+            }
+            __syncthreads();
+
             for(int r = 0; r < kWorldSize; r++)
             {
-                // Wait for the flags to be set.
-                if(thread == 0)
-                {
-                    wait_sync_flag(&flag_ptr[r], flag_color);
-                }
-                __syncthreads();
-
                 // Gather all reduced and final rank segments into tA.
                 codec.recv(&recv_buffer, &tA[r * Codec::kRankAtoms]);
             }
@@ -1031,14 +1035,14 @@ struct AllReduceTwoshotRMSNorm
             int32x4_t* recv_buffer = reinterpret_cast<int32x4_t*>(rank_buffer + comm_data0_offset);
             uint32_t* flag_ptr     = reinterpret_cast<uint32_t*>(rank_buffer + comm_flags0_offset);
 
+            if(thread < kWorldSize)
+            {
+                wait_sync_flag(&flag_ptr[thread], flag_color);
+            }
+            __syncthreads();
+
             for(int r = 0; r < kWorldSize; r++)
             {
-                if(thread == 0)
-                {
-                    wait_sync_flag(&flag_ptr[r], flag_color);
-                }
-                __syncthreads();
-
                 codec.recv(&recv_buffer, tA);
 
                 for(int i = 0; i < Codec::kRankAtoms; i++)
@@ -1068,14 +1072,14 @@ struct AllReduceTwoshotRMSNorm
             int32x4_t* recv_buffer = reinterpret_cast<int32x4_t*>(rank_buffer + comm_data1_offset);
             uint32_t* flag_ptr     = reinterpret_cast<uint32_t*>(rank_buffer + comm_flags1_offset);
 
+            if(thread < kWorldSize)
+            {
+                wait_sync_flag(&flag_ptr[thread], flag_color);
+            }
+            __syncthreads();
+
             for(int r = 0; r < kWorldSize; r++)
             {
-                if(thread == 0)
-                {
-                    wait_sync_flag(&flag_ptr[r], flag_color);
-                }
-                __syncthreads();
-
                 codec.recv(&recv_buffer, &tA[r * Codec::kRankAtoms]);
             }
         }
