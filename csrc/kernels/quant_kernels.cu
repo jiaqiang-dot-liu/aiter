@@ -697,22 +697,84 @@ void static_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
     else if((gs) == 64)   { constexpr int32_t _GS = 64;  __VA_ARGS__ } \
     else                  { constexpr int32_t _GS = 128; __VA_ARGS__ }
 
+// Per-tensor quantization is layout agnostic: the emitted scale is a single
+// absMax over *every* element of the buffer, and the store pass is purely
+// elementwise. The (rows, cols) split the caller happens to use therefore has
+// no bearing on the result, only on the launch geometry.
+//
+// The original decomposition launched one `BlockSize`-thread block per logical
+// row. For this model's activations (cols = 2816, vec_size = 16 -> 176 vectors
+// per row) that leaves 80 of every block's 256 threads with no vector to load
+// or store -- ~31% of the dispatched threads idle on a kernel pair that is
+// otherwise purely bandwidth bound, and 31% more blocks than the work needs.
+//
+// Re-tiling the same contiguous buffer into rows of exactly
+// `BlockSize * vec_size` elements makes num_vecs == BlockSize, so every thread
+// performs one full vectorized load (and one full store) and no block is
+// short-changed. Because max() is associative, commutative and exact, and the
+// scaling pass is elementwise with the identical `inverted_scale`, the bytes
+// this emits are bitwise identical to the per-logical-row decomposition.
+//
+// Returns true when `rows` / `cols` were rewritten to the retiled geometry.
+static inline bool retile_per_tensor_quant(const aiter_tensor_t& out,
+                                           const aiter_tensor_t& input,
+                                           int& rows,
+                                           int& cols)
+{
+    // Both fp8 and i8 outputs use vec_size_i = 16 / sizeof(DTYPE_O) = 16.
+    constexpr int64_t vec_size = 16;
+    constexpr int64_t tile     = static_cast<int64_t>(BlockSize) * vec_size;
+
+    // Only worth doing when blocks are currently under-filled.
+    if(static_cast<int64_t>(cols) >= tile)
+        return false;
+    // The retile walks the buffer as one flat contiguous run.
+    if(!input.is_contiguous() || !out.is_contiguous())
+        return false;
+
+    const int64_t numel = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
+    // A ragged final tile would need bounds the row-oriented kernels do not
+    // take; fall back rather than read past the end of the tensor.
+    if(numel % tile != 0)
+        return false;
+
+    const int64_t new_rows = numel / tile;
+    if(new_rows < 1 || new_rows > 0x7fffffffLL)
+        return false;
+
+    rows = static_cast<int>(new_rows);
+    cols = static_cast<int>(tile);
+    return true;
+}
+
 void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
                               const aiter_tensor_t& input,  // [..., d]
                               aiter_tensor_t& scale)        // [1]
 {
-    const int cols = input.size(-1);
+    int cols = input.size(-1);
     int rows       = input.numel() / cols;
+    retile_per_tensor_quant(out, input, rows, cols);
     dim3 grid(rows);
     dim3 block(BlockSize);
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+    // `data_to_scale_kernel` accumulates with atomicMax and therefore needs the
+    // destination seeded to +0.0f. Doing that with `initializeScale` spent a
+    // full kernel dispatch to write four bytes -- measured at 1.82% of E2E GPU
+    // time across 1560 invocations on the MI355X Gemma-4 trace. hipMemsetAsync
+    // expresses the identical store (all-zero bytes == +0.0f) as a memset node,
+    // which is stream-capture safe and materially cheaper to replay inside the
+    // captured decode HIP graph.
+    const auto seed_scale = [&] {
+        AITER_CHECK(hipMemsetAsync(scale.data_ptr(), 0, sizeof(float), stream) == hipSuccess,
+                    __func__,
+                    " failed to zero the per-tensor scale accumulator");
+    };
     if(out.dtype() == AITER_DTYPE_fp8)
     {
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
-                reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
+            seed_scale();
             aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
                 reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
@@ -726,8 +788,7 @@ void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
     {
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
-                reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
+            seed_scale();
             aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
                 reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
