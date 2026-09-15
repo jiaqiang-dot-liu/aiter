@@ -33,6 +33,12 @@ def compile(
         print(
             "EXPERIMENTAL pa_ragged kernel requires head_size=128 and kv_dtype=bf16. Fallback to original kernel"
         )
+        # The message above promised a fallback but `version` was still passed
+        # through as "EXPERIMENTAL", so an unsupported (head_size, kv_dtype)
+        # combination silently compiled the experimental kernel anyway and
+        # produced garbage/NaN logits instead of falling back. Actually
+        # perform the advertised fallback.
+        version = "GOLDEN"
 
     return compile_template_op(
         src_template,
