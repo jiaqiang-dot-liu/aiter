@@ -20,6 +20,7 @@
 #include "opus/opus.hpp"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <iostream>
 #include <limits>
@@ -4574,7 +4575,49 @@ class CustomAllreduce
         }
         else if(full_nvlink_)
         {
-            if((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
+            // 1-stage vs 2-stage crossover.
+            //
+            // 1-stage reads every peer's full buffer and reduces locally: one
+            // grid-wide multi-GPU barrier, (N-1)x the peer traffic. 2-stage is
+            // reduce-scatter + all-gather: ~N x less traffic, but *two*
+            // barriers. Each barrier costs the max inter-rank skew, so the
+            // crossover is set by (link bandwidth) vs (barrier + skew).
+            //
+            // The 80 KiB world_size<=8 cutoff below was tuned on gfx942. On
+            // gfx950 (MI355X) the per-link xGMI bandwidth is high enough that
+            // the extra 1-stage traffic is cheaper than the second barrier for
+            // decode-shaped messages, so the crossover moves up. A TP8 decode
+            // all-reduce for a 7168-wide bf16 model at batch 64 is 896 KiB and
+            // lands inside the new window; multi-MB prefill all-reduces stay on
+            // 2-stage, where the traffic term dominates again.
+            //
+            // AITER_AR_1STAGE_MAX_BYTES overrides the cutoff in bytes so the
+            // crossover can be swept without recompiling (unset / negative =
+            // use the arch-aware default below, 0 = always 2-stage).
+            static const long ar_1stage_max_bytes_override = []() -> long {
+                const char* e = std::getenv("AITER_AR_1STAGE_MAX_BYTES");
+                return e ? std::atol(e) : -1L;
+            }();
+
+            long one_stage_max_bytes;
+            if(ar_1stage_max_bytes_override >= 0)
+            {
+                one_stage_max_bytes = ar_1stage_max_bytes_override;
+            }
+            else if(world_size_ <= 4)
+            {
+                one_stage_max_bytes = 160 * 1024;
+            }
+            else if(arch.find("gfx950") != std::string::npos)
+            {
+                one_stage_max_bytes = 1024 * 1024;
+            }
+            else
+            {
+                one_stage_max_bytes = 80 * 1024;
+            }
+
+            if(static_cast<long>(bytes) < one_stage_max_bytes)
             {
                 call_1stage = true;
             }
