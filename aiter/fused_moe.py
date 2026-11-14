@@ -6205,6 +6205,18 @@ def fused_moe_2stages(
             )
     if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
         extra_stage1_args["v2_output_layout"] = True
+    fuse_splitk_quant = (
+        stage1_func is ck_moe_stage1
+        and metadata.ksplit > 1
+        and not metadata.fuse_quant
+        and quant_type == QuantType.per_1x128
+        and activation == ActivationType.Silu
+        and q_dtype_a == dtypes.fp8
+        and a2_scale is None
+        and m_indices is None
+    )
+    if fuse_splitk_quant:
+        extra_stage1_args["fuse_fp8_quant"] = True
     if stage1_func is _flydsl_stage1_wrapper:
         extra_stage1_args["situ_beta"] = config_situ_beta
         extra_stage1_args["situ_linear_beta"] = config_situ_linear_beta
@@ -6288,6 +6300,10 @@ def fused_moe_2stages(
         or m_indices is not None
     ):
         a2, a2_scale = a2[0], a2[1]
+    elif fuse_splitk_quant and isinstance(a2, tuple):
+        # Not a tuple when ck_moe_stage1 dropped split-K (runtime SiLU clamp).
+        a2, a2_scale = a2
+        a2 = a2.view(token_num, topk, -1)
     elif metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
         _fp4_bytes = token_num * topk * (inter_dim // 2)
@@ -6922,6 +6938,7 @@ def ck_moe_stage1(
     use_non_temporal_load=False,
     dtype=None,
     swiglu_limit=None,
+    fuse_fp8_quant=False,
 ):
     limit = None
     if swiglu_limit and activation == ActivationType.Silu:
@@ -6972,6 +6989,18 @@ def ck_moe_stage1(
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
+        if fuse_fp8_quant:
+            # Returns (a2, a2_scale): one launch from the fp32 accumulator to
+            # the fp8 stage2 input and its per-128 scales, instead of
+            # silu_and_mul to bf16 plus a separate quant.
+            from aiter.ops.triton.fusions.activation import (
+                act_mul_and_fp8_group_quant,
+            )
+
+            assert activation == ActivationType.Silu
+            return act_mul_and_fp8_group_quant(
+                valid_out.view(dtypes.fp32), "silu", 128, dtypes.fp8
+            )
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
         elif activation == ActivationType.Gelu:
